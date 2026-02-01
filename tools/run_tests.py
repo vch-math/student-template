@@ -26,6 +26,7 @@ def detect_language(lab_dir: pathlib.Path) -> Tuple[str, pathlib.Path]:
         "c": lab_dir / "main.c",
         "cpp": lab_dir / "main.cpp",
         "java": lab_dir / "Main.java",
+        "go": lab_dir / "main.go",
     }
     for lang, path in mapping.items():
         if path.exists():
@@ -48,6 +49,10 @@ def compile_program(lang: str, source: pathlib.Path, build_dir: pathlib.Path) ->
     if lang == "java":
         subprocess.run(["javac", str(source)], check=True, cwd=source.parent)
         return ["java", "-cp", str(source.parent), "Main"]
+    if lang == "go":
+        output = build_dir / "main"
+        subprocess.run(["go", "build", "-o", str(output), str(source)], check=True)
+        return [str(output)]
 
     run_cmd = os.getenv("RUN_CMD")
     if run_cmd:
