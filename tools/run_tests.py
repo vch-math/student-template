@@ -71,18 +71,57 @@ def run_test(cmd: List[str], input_data: bytes, timeout_sec: int) -> subprocess.
     )
 
 
+def normalize_text(value: str) -> str:
+    return value.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
+
+
+def extract_first_line(output_text: str) -> str:
+    for line in output_text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def get_variant_selector(variant: Dict) -> str:
+    selector = variant.get("selector")
+    if isinstance(selector, str) and selector.strip():
+        return selector.strip()
+    out_contains = variant.get("out_contains")
+    if isinstance(out_contains, list) and out_contains:
+        first = out_contains[0]
+        return first.strip() if isinstance(first, str) else str(first)
+    if isinstance(out_contains, str) and out_contains.strip():
+        return out_contains.strip()
+    return ""
+
+
+def format_expected(out_contains: List[str], out_regex: List[str], expected_solution) -> str:
+    parts = []
+    if out_contains:
+        parts.append(f"Ожидаемые строки: {out_contains}")
+    if out_regex:
+        parts.append(f"Ожидаемые regex: {out_regex}")
+    if expected_solution is not None:
+        parts.append(f"Ожидаемое решение: {expected_solution}")
+    return "\n".join(parts)
+
+
 def check_contains(stdout: str, expected: List[str]) -> List[str]:
     missing = []
+    normalized_stdout = normalize_text(stdout)
     for item in expected:
-        if item not in stdout:
+        normalized_item = normalize_text(item)
+        if normalized_item not in normalized_stdout:
             missing.append(item)
     return missing
 
 
 def check_regex(stdout: str, expected: List[str]) -> List[str]:
     missing = []
+    normalized_stdout = normalize_text(stdout)
     for pattern in expected:
-        if re.search(pattern, stdout) is None:
+        if re.search(pattern, normalized_stdout) is None:
             missing.append(f"regex:{pattern}")
     return missing
 
@@ -188,7 +227,7 @@ def evaluate_variant(
     expected_solution = variant.get("expected_solution")
     if expected_solution is not None:
         if variant.get("use_input_tolerance"):
-            scale = float(variant.get("tolerance_scale", 1.0))
+            scale = float(variant.get("tolerance_scale") or 1.0)
             tol = parse_input_tolerance(input_text, default_tol) * scale
         else:
             tol = float(variant.get("solution_tolerance", default_tol))
@@ -212,35 +251,62 @@ def main() -> int:
     cmd = compile_program(lang, source, build_dir)
 
     manifest = read_manifest(lab)
+    show_answers = bool(manifest.get("show_answers"))
+    input_description = manifest.get("input_description")
+    select_variant_by_output = bool(manifest.get("select_variant_by_output"))
     tests = manifest.get("tests", [])
     timeout_sec = int(manifest.get("timeout_sec", 5))
     default_tol = float(manifest.get("solution_tolerance", 1e-3))
+
+    if input_description:
+        print("Формат ввода:")
+        print(input_description)
+        print("")
 
     if not tests:
         print("Манифест не содержит тестов.", file=sys.stderr)
         return 1
 
     failed = 0
-    for test in tests:
+    for index, test in enumerate(tests, start=1):
         lab_tests_dir = TESTS_ROOT / f"lab-{lab}"
         input_dir = lab_tests_dir / "input"
         expected_dir = lab_tests_dir / "expected"
         input_data = resolve_input(test, input_dir)
         input_text = input_data.decode("utf-8", errors="replace")
+        print(f"\nТест {index}:")
+        print(input_text)
         variants = test.get("variants")
         expected = normalize_expected(test.get("out_contains"), expected_dir)
         expected_regex = normalize_expected(test.get("out_regex"), expected_dir)
         result = run_test(cmd, input_data, timeout_sec)
         stdout = result.stdout.decode("utf-8", errors="replace")
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        output_text = f"{stdout}\n{stderr}" if stderr else stdout
 
         if variants:
             passed = False
             missing = []
-            for variant in variants:
+            selected_variant = None
+            selected_label = ""
+            last_variant = None
+            if select_variant_by_output:
+                first_line = extract_first_line(output_text)
+                normalized_first = normalize_text(first_line)
+                for variant in variants:
+                    selector = get_variant_selector(variant)
+                    if selector and normalize_text(selector) in normalized_first:
+                        selected_variant = variant
+                        selected_label = variant.get("description") or selector
+                        break
+
+            variant_list = [selected_variant] if selected_variant else variants
+            for variant in variant_list:
+                last_variant = variant
                 variant_expected = normalize_expected(variant.get("out_contains"), expected_dir)
                 variant_regex = normalize_expected(variant.get("out_regex"), expected_dir)
                 passed, missing = evaluate_variant(
-                    stdout,
+                    output_text,
                     {
                         "out_contains": variant_expected,
                         "out_regex": variant_regex,
@@ -254,24 +320,47 @@ def main() -> int:
                 )
                 if passed:
                     break
+                if selected_variant:
+                    break
         else:
             missing = []
-            missing.extend(check_contains(stdout, expected))
-            missing.extend(check_regex(stdout, expected_regex))
+            missing.extend(check_contains(output_text, expected))
+            missing.extend(check_regex(output_text, expected_regex))
             if "expected_solution" in test:
                 if test.get("use_input_tolerance"):
                     scale = float(test.get("tolerance_scale", 1.0))
                     tol = parse_input_tolerance(input_text, default_tol) * scale
                 else:
                     tol = float(test.get("solution_tolerance", default_tol))
-                missing.extend(check_solution(stdout, test.get("expected_solution", []), tol))
+                missing.extend(check_solution(output_text, test.get("expected_solution", []), tol))
             passed = len(missing) == 0
 
         if not passed:
             failed += 1
-            print(f"Тест {test['in']} не прошел: нет {missing}")
+            if output_text:
+                print("\n--- OUTPUT (stdout+stderr) ---")
+                print(output_text)
+                print("--- END OUTPUT ---\n")
+            if variants and select_variant_by_output and selected_label:
+                print(f"Выбранный вариант: {selected_label}")
+            if show_answers:
+                if variants:
+                    variant_for_expected = selected_variant or last_variant
+                    exp_contains = normalize_expected(variant_for_expected.get("out_contains"), expected_dir)
+                    exp_regex = normalize_expected(variant_for_expected.get("out_regex"), expected_dir)
+                    exp_solution = variant_for_expected.get("expected_solution")
+                else:
+                    exp_contains = expected
+                    exp_regex = expected_regex
+                    exp_solution = test.get("expected_solution")
+                details = format_expected(exp_contains, exp_regex, exp_solution)
+                if details:
+                    print(details)
+            test_label = test.get("description") or f"#{index}"
+            print(f"Тест {test_label} не прошел")
         else:
-            print(f"Тест {test['in']} прошел")
+            test_label = test.get("description") or f"#{index}"
+            print(f"Тест {test_label} прошел")
 
     return 0 if failed == 0 else 1
 
